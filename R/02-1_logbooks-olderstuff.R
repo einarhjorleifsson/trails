@@ -1,15 +1,15 @@
-# How to run things ------------------------------------------------------------
+# Preamble ---------------------------------------------------------------------
 # run this as:
-#  nohup R < R/02_logbooks.R --vanilla > logs/02_logbooks_2023-09-01.log &
-
-# Taken from the ices datacall directory
-#  Here we need to fix the visir stuff (before change the visir is overwritten
-#   with new numbers)
-#   And possibly rerun the trail stuff
-
+#  nohup R < R/02_logbooks.R --vanilla > logs/02_logbooks_YYYY-MM-DD.log &
 lubridate::now()
 
+# Input:  Oracle database
+# Output: data/logbooks/logbooks_2009p.parguet
+#         data/logbooks/catch_2009p.parquet
+# Downstream usage: R/02-2_logbooks-gear-correction.R
 
+## Brief summary ---------------------------------------------------------------
+# The main output file is just a flat file 
 
 # A brief outline --------------------------------------------------------------
 # A single logbook munging to then be used downstream for stk match
@@ -28,14 +28,17 @@ lubridate::now()
 #      Should ICES metier be set here or further downstream?
 #
 # PROCESSING STEPS:
+#  0. Merge old and new logbook data - a messy affair
 #  1. Get and merge logbook and landings data
-#  2. Gear corrections
-#  3. Lump some gears
+#  2. Gear corrections - code results are from some iterative procedures
+#  3. Lump some gears - ideally should not do that
 #  4. Cap effort and end of action
 #  5. Mesh size "corrections"
 #  6. Set gear width proxy
 #  7. gear class of corrected gid
+#     HERE WE SAVE STUFF FOR NON ICES-STUFF
 #  8. Match vid with mobileid in stk
+#     NO LONGER IN USE
 #  9. Add vessel information - only needed for ICES datacall
 # 10. Add metier - only needed for ICES datacall
 # 11. ICES rectangles - only needed for ICES datacall
@@ -62,8 +65,8 @@ match_nearest_date <- function(lb, ln) {
   
   ln.dt <-
     ln %>%
-    select(vid, datel) %>%
-    distinct() %>%
+    select(vid, datel, .lid) %>%
+    distinct(vid, datel, .keep_all = TRUE) %>%
     mutate(dummy = datel) %>%
     setDT()
   
@@ -74,7 +77,7 @@ match_nearest_date <- function(lb, ln) {
   lb %>%
     left_join(res,
               by = c("vid", "datel")) %>%
-    left_join(ln %>% select(vid, date.ln = datel, gid.ln),
+    left_join(ln %>% select(vid, date.ln = datel, gid.ln, .lid),
               by = c("vid", "date.ln"))
   
 }
@@ -218,10 +221,7 @@ LGS_old |>
 
 ## 1.2 New logbooks ------------------------------------------------------------
 # 2023-05-25: The new logbooks are in principle a total mess
-#             Here just some quick has is done for the ICES datacall
-# [cut]
-## 2023-05-29 Ignore above -----------------------------------------------------
-# the function flow results in slow excecution
+#             Here just some quick hash is done for the ICES datacall
 lb_trip_new <- function(con) {
   tbl_mar(con, "adb.trip_v") |> 
     select(trip_id, 
@@ -445,11 +445,30 @@ LGS_new <-
   n_base |> 
   left_join(n_catch)
 
+
+
+# identical visir/station_id
+visir_old <- LGS_old$visir
+visir_new <- LGS_new$station_id
+test1 <- visir_old %in% visir_new
+table(test1)
+test2 <- visir_new %in% visir_old
+table(test2)
+LGS_new |> 
+  mutate(test2 = test2) |> 
+  filter(test2) |> 
+  glimpse()
+# here we just drop the duplicate ids in the new logbooks
+LGS_new <- 
+  LGS_new |> 
+  filter(!station_id %in% LGS_old$visir)
+
+
 LGS <- 
-  bind_rows(LGS_old |> mutate(base = "old", visir_org = visir),
-            LGS_new |> mutate(base = "new")) |> 
+  bind_rows(LGS_old |> mutate(base = "old") |> rename(.sid = visir),
+            LGS_new |> mutate(base = "new") |> rename(.sid = station_id))
   # NEW VISIR
-  mutate(visir = 1:n())
+  # mutate(visir = 1:n())
 
 # testing if vid-date by source are unique
 LGS |> 
@@ -479,30 +498,39 @@ LGS |>
 n0 <- nrow(LGS)
 paste("Original number of records:", n0)
 
-# get the gear from landings
+# Should one not worry about this:
+table(LGS$base, !is.na(LGS$orphan))
+LGS |> 
+  filter(base == "new") |> 
+  count(source, orphan) |> 
+  spread(orphan, n)
+
+# 2. Gear corrections ----------------------------------------------------------
+#   get the gear from landings
+#   ideally should use agf, that is what was used in the "datalab-project"
 tmp.ln.base <-
   omar::ln_catch(con) %>%
   filter(!is.na(vid), !is.na(date)) %>%
   mutate(year = year(date)) %>%
   filter(year %in% YEARS) %>%
-  select(vid, gid.ln = gid, datel = date) %>%
+  select(vid, .lid = ID, gid.ln = gid, datel = date) %>%
   distinct() %>%
   collect(n = Inf) %>%
   mutate(datel = as_date(datel),
          gid.ln = as.integer(gid.ln))
 
-
-
 tmp.lb.ln.match <-
   LGS %>% 
+  # Note this match is different than used in the "datalab-project"
   match_nearest_date(tmp.ln.base) %>% 
-  select(visir, gid.ln) %>% 
+  select(.sid, .lid, gid.ln) %>% 
   # just take the first match, i.e. ignore second landing within a day
-  distinct(visir, .keep_all = TRUE)
+  distinct(.sid, .keep_all = TRUE)
 LGS <- 
   LGS %>% 
   left_join(tmp.lb.ln.match,
-            by = "visir")
+            by = ".sid")
+LGS |> glimpse()
 # Vessels per year - few vessels in 2021 is because of records for some
 #  small vessels have not been entered
 LGS %>% 
@@ -512,7 +540,7 @@ LGS %>%
   spread(gid, n.vids) |> 
   knitr::kable()
 paste("Number of records:", nrow(LGS))
-LGS %>% write_rds("LGS_raw.rds")
+# LGS %>% write_rds("LGS_raw.rds")
 # rm(tmp.lb.base, tmp.lb.catch, tmp.lb.mobile, tmp.lb.static, tmp.ln.base, tmp.lb.ln.match)
 # end: Get and merge logbook and landings data
 
@@ -524,8 +552,7 @@ LGS %>%
   spread(has.effort, n, fill = 0) |> 
   knitr::kable(caption = "Missing effort (no) - correct once gid has been corrected")
 
-
-# 2. Gear corrections ----------------------------------------------------------
+# NOTE: Why not use GEARS above?
 gears <-
   #tbl_mar(con, "ops$einarhj.gear") %>% collect(n = Inf) %>%
   # 2021-08-23 changes
@@ -540,7 +567,7 @@ LGS <-
   mutate(gid.lb = gid) |> 
   left_join(gears %>% select(gid.lb = gid, gc.lb = gclass), by = "gid.lb") %>% 
   left_join(gears %>% select(gid.ln = gid, gc.ln = gclass), by = "gid.ln") %>% 
-  select(visir:gid.ln, gc.lb, gc.ln, everything()) %>% 
+  select(.sid:gid.ln, gc.lb, gc.ln, everything()) %>% 
   mutate(gid = NA_integer_,
          gid.source = NA_character_) %>% 
   mutate(i = gid.lb == gid.ln,
@@ -623,7 +650,6 @@ LGS <-
          gid.source = ifelse(i, "gid.ln=21, gid.lb=14   -> gid.lb", gid.source),
          step = ifelse(i, 18L, step))
 
-
 paste("Number of records:", nrow(LGS))
 LGS %>% 
   count(step, gid, gid.lb, gid.ln, gid.source) %>% 
@@ -637,12 +663,11 @@ LGS %>%
   knitr::kable(caption = "Number and percentage of missing gear")
 # end: Gear corrections
 
-
 # 3. Lump some gears -----------------------------------------------------------
 LGS <-
   LGS %>% 
   mutate(gid = case_when(gid %in% c(10, 12) ~ 4,   # purse seines
-                         gid %in% c(18, 39) ~ 18,      # traps
+                         gid %in% c(18, 39) ~ 18,  # traps
                          TRUE ~ gid)) %>% 
   # make the rest a negative number
   mutate(gid = ifelse(is.na(gid), -666, gid)) %>% 
@@ -753,7 +778,24 @@ LGS <-
             by = "gid")
 paste("Number of records:", nrow(LGS))
 
+# SAVE AS PARQUET --------------------------------------------------------------
+# NOTE - WE STILL HAVE NOT COLLAPSED RECORDS, may need to do some of the stuff 
+#        downstream
+LGS |> glimpse()
+# something to fix upstream
+LGS |> 
+  mutate(has_landings_id = !is.na(.lid)) |> 
+  count(has_landings_id)
+library(arrow)
+write_parquet(LGS, "data/logbooks/logbooks_2009-2022.parquet")
 
+devtools::session_info()
+
+
+
+# NOT RUN BELOW ----------------------------------------------------------------
+
+if(FALSE) {
 # 8. Match vid with mobileid in stk --------------------------------------------
 
 # 2023-05-19 - new approach, older approach below - set to FALSE
@@ -780,109 +822,7 @@ summary.lgs |>
   filter(is.na(mid)) |> 
   knitr::kable(caption = "Vessels with no matching mobileid")
 
-
-# 2023-05-19 - earlier years stuff
-if(FALSE) {
-  vid.stk <-
-    # 2022-04-18 change
-    # mar:::stk_mobile_icelandic(con, correct = TRUE, vidmatch = TRUE) %>% 
-    # 2023-05-10 change
-    tbl_mar(con, "ops$einarhj.mobile_vid") %>% 
-    filter(pings > 0) |> 
-    select(mid, vid, pings, t1, t2) |>  
-    collect(n = Inf)
-  # Create a summary overview of logbook and stk informations, not necessary
-  #  for the workflow
-  summary.lgs <-
-    LGS %>% 
-    group_by(vid) %>% 
-    summarise(n.lgs = n(),
-              n.gid = n_distinct(gid),
-              min.date = min(date),
-              max.date = max(date),
-              .groups = "drop")
-  MIDs <- 
-    summary.lgs %>% 
-    left_join(vid.stk, by = "vid") %>% 
-    pull(mid) %>% 
-    unique()
-  # unexpected
-  table(!is.na(MIDs))
-  MIDs <- MIDs[!is.na(MIDs)]
-  # can only have 1000 records in filter downstream
-  mids1 <- MIDs[1:1000]
-  mids2 <- MIDs[1001:length(MIDs)]
-  summary.stk <-
-    bind_rows(stk_trail(con) %>% 
-                filter(mid %in% mids1,
-                       time >= to_date("2009-01-01", "YYYY:MM:DD"),
-                       time <  to_date("2022-12-31", "YYYY:MM:DD")) %>% 
-                group_by(mid) %>% 
-                summarise(n.stk = n(),
-                          min.time = min(time, na.rm = TRUE),
-                          max.time = max(time, na.rm = TRUE)) %>% 
-                collect(n = Inf),
-              stk_trail(con) %>% 
-                filter(mid %in% mids2,
-                       time >= to_date("2009-01-01", "YYYY:MM:DD"),
-                       time <  to_date("2022-12-31", "YYYY:MM:DD")) %>% 
-                group_by(mid) %>% 
-                summarise(n.stk = n(),
-                          min.time = min(time, na.rm = TRUE),
-                          max.time = max(time, na.rm = TRUE)) %>% 
-                collect(n = Inf))
-  # NOTE: get here more records than in the logbooks summary because 
-  #       some vessels have multiple mid, and then some, ... 
-  print(c(nrow(summary.lgs), nrow(summary.stk)))
-  d <- 
-    summary.stk %>% 
-    left_join(vid.stk %>% 
-                select(mid, vid), by = "mid") %>% 
-    full_join(summary.lgs, by = "vid") %>% 
-    group_by(vid) %>% 
-    mutate(n.mid = n()) %>% 
-    ungroup() %>% 
-    # 2021-08-23 changes
-    left_join(omar:::vid_registry(con, standardize = TRUE) %>% 
-                select(vid, vessel) %>% 
-                collect(n = Inf), by = "vid") %>% 
-    select(vid, mid, vessel, n.lgs, n.stk, n.mid, everything()) %>% 
-    arrange(vid)
-  d %>% 
-    filter(is.na(mid)) %>% 
-    select(vid, vessel, n.lgs, n.gid:max.date) %>% 
-    knitr::kable(caption = "Vessels with no matching mobileid")
-  d %>% 
-    filter(!is.na(mid),
-           n.lgs <= 10) %>% 
-    arrange(n.lgs, -n.stk) %>% 
-    knitr::kable(caption = "Vessels with low logbook records")
-  # NOTE: Not sure if this is needed:
-  d %>% write_rds("data/VID_MID.rds")
-  vidmid_lookup <- 
-    d %>% 
-    select(vid, mid)
-  # add mobileid as string to LGS, this could also have been archieved with nest
-  # 2022-04-18: Not sure why doing this
-  d2 <- 
-    d %>% 
-    select(vid, mid) %>% 
-    arrange(vid) %>% 
-    group_by(vid) %>% 
-    mutate(midnr = 1:n()) %>% 
-    spread(midnr, mid) %>% 
-    mutate(mids = case_when(#!is.na(`3`) ~ paste(`1`, `2`, `3`, sep = "-"),
-      !is.na(`2`) ~ paste(`1`, `2`, sep = "-"),
-      TRUE ~ as.character(`1`))) %>% 
-    select(vid, mids)
-  # NOTE: Should maybe put a flag here for no mid match
-  LGS <- 
-    LGS %>% 
-    left_join(d2)
-  paste("Number of records:", nrow(LGS))
-}
 # end: 8. Match vid with mobileid in stk
-
 
 # 9. Add vessel information ----------------------------------------------------
 vessels <- 
@@ -892,8 +832,6 @@ vessels <-
   arrange(vid) %>% 
   collect(n = Inf) %>% 
   filter(vid %in% unique(LGS$vid))
-
-
 
 vessel.miss <- 
   vessels %>% 
@@ -1167,5 +1105,7 @@ LGS.collapsed <-
   mutate(year = year(date))
 
 LGS.collapsed %>% write_rds("data/logbooks.rds")
+} # end of if - stuff not run
 
-devtools::session_info()
+
+
