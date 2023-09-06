@@ -1,6 +1,6 @@
 # Preamble ---------------------------------------------------------------------
 # run this as:
-#  nohup R < R/02_logbooks.R --vanilla > logs/02_logbooks_YYYY-MM-DD.log &
+#  nohup R < R/02-1_logbooks-merge.R --vanilla > logs/02-1_logbooks-merge_2023-09-04.log &
 lubridate::now()
 
 # Input:  Oracle database
@@ -368,9 +368,88 @@ CATCH <-
   bind_rows(CATCH_old,
             CATCH_new)
 
+# Add landing id and gid from landings data ------------------------------------
+## Landings data ---------------------------------------------------------------
+LN_raw <- 
+  omar::ln_agf(con) |> 
+  filter(wt > 0,
+         year(date) %in% YEARS) |> 
+  rename(.lid = .id,
+         hid_ln = hid,
+         gid_ln = gid,
+         datel = date) |> 
+  collect(n = Inf) |> 
+  filter(vid %in% c(2, 5:3699, 5000:9998)) |> 
+  mutate(datel = as_date(datel),
+         vid = as.integer(vid),
+         gid_ln = as.integer(gid_ln),
+         hid_ln = as.integer(hid_ln)) |> 
+  arrange(vid, datel, .lid, gid_ln, sid) |>
+  group_by(vid, datel) |> 
+  mutate(.lid_min = min(.lid)) |> 
+  ungroup()
+
+## Checks ----------------------------------------------------------------------
+checks <- 
+  LN_raw |> 
+  group_by(vid, datel) |> 
+  summarise(n_harbours = n_distinct(hid_ln),
+            n_gears = n_distinct(gid_ln),
+            n_lid = n_distinct(.lid),
+            .groups = "drop")
+#### Same landings date, different harbours ------------------------------------
+checks |> count(n_harbours) |> mutate(p = round(n / sum(n), 3))
+#### Same landings date, different gear ----------------------------------------
+checks |> count(n_gears) |> mutate(p = round(n / sum(n), 3))
+#### Same landings date, different landings id ---------------------------------
+checks |> count(n_lid) |> mutate(p = round(n / sum(n), 3))
+
+## Landings and gear id only ---------------------------------------------------
+LN <-  
+  LN_raw |> 
+  select(vid, datel, gid_ln, .lid_min) |> 
+  # here only keep one gid record and the lowest .lid wihtin a landings date
+  distinct(vid, datel, .lid_min, .keep_all = TRUE)
+### Nearest date match ---------------------------------------------------------
+#### Function ------------------------------------------------------------------
+match_nearest_date <- function(lb, ln) {
+  
+  lb.dt <-
+    lb %>%
+    select(vid, datel) %>%
+    distinct() %>%
+    setDT()
+  
+  ln.dt <-
+    ln %>%
+    select(vid, datel) %>%
+    distinct() %>%
+    mutate(dummy = datel) %>%
+    setDT()
+  
+  res <-
+    lb.dt[, date.ln := ln.dt[lb.dt, dummy, on = c("vid", "datel"), roll = "nearest"]] %>%
+    as_tibble()
+  
+  lb %>%
+    left_join(res,
+              by = c("vid", "datel")) %>%
+    left_join(ln %>% select(vid, date.ln = datel, gid_ln, .lid_min),
+              by = c("vid", "date.ln"))
+  
+}
+
+LGS <-
+  LGS |> 
+  match_nearest_date(LN) |> 
+  rename(date_ln = date.ln)
+
 # Save -------------------------------------------------------------------------
 LGS   |> write_rds("data/logbooks/station.rds")
 CATCH |> write_rds("data/logbooks/catch.rds")
 library(arrow)
 LGS   |> arrow::write_parquet("data/logbooks/station.parquet")
 CATCH |> arrow::write_parquet("data/logbooks/catch.parquet")
+
+# Info -------------------------------------------------------------------------
+devtools::session_info()
